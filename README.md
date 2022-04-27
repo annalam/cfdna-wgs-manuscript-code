@@ -31,6 +31,19 @@ Steps 5 - 8 are only required for some of the analysis steps, so you may be able
 
 
 
+## Read alignment
+
+All plasma cfDNA and metastatic tissue biopsy samples were sequenced using Illumina X Ten instruments. The paired end sequencing reads were adapter-trimmed using cutadapt-1.11, quality-masked using seqkit-0.8, and then aligned against the human hg38 reference genome using Bowtie-2.3.0. Duplicate DNA fragments were identified and marked using samblaster-0.1.24:
+```
+fasta interleave sample_1.fq.gz sample_2.fq.gz | \
+  cutadapt --interleaved -f fastq -m 20 -a AGATCGGAAGAGC -A AGATCGGAAGAGC - | \
+  fasta trim by quality - 30 | fasta mask by quality - 20 | \
+  bowtie2 -p20 -X 1000 --score-min L,0,-0.6 --ignore-quals -x hg38 --interleaved - | \
+  samblaster | samtools view -u - | samtools sort -@ 8 -m 4G -o sample.bam
+```
+
+
+
 
 
 ## Somatic mutation analysis
