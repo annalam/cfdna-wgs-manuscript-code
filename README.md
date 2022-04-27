@@ -164,8 +164,7 @@ breakfast annotate sample.filtered.sv ensembl_84_genes.bed > sample.annotated.sv
 
 ## Inference of cancer fraction and truncal copy number profile
 
-To infer a truncal copy number model for each patient sample, we started out with files `*_logratio.igv` and `*_hetz_snp.tsv` for each sample, and `*_mutations.tsv` for the patient. These files were created using the procedures described in earlier sections of this document. We have made example data available for two simulated patient cases PatientA and PatientB (see section “Generation of simulated cancer patients”):
-https://www.dropbox.com/s/hofrv1vlnln1mau/example_patients.zip?dl=0
+To infer a truncal copy number model for each patient sample, we started out with files `*_logratio.igv` and `*_hetz_snp.tsv` for each sample, and `*_mutations.tsv` for the patient. These files were created using the procedures described in earlier sections of this document. We have made [example data](https://www.dropbox.com/s/hofrv1vlnln1mau/example_patients.zip?dl=0) available for two simulated patient cases PatientA and PatientB (see section “Generation of simulated cancer patients”).
 
 The first step in truncal copy number model was to identify the boundaries of genomic copy number alterations using a joint analysis of all same-patient samples:
 ```
