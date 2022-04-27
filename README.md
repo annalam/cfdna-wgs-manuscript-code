@@ -26,9 +26,10 @@ export JULIA_LOAD_PATH=/path/to/this/repository:
 
 Steps 5 - 8 are only required for some of the analysis steps, so you may be able to skip some steps depending on what analyses you wish to run.
 
+Simulated patient data files for experimenting with our subclonal reconstruction algorithms is also available here:
+https://www.dropbox.com/s/hofrv1vlnln1mau/example_patients.zip?dl=0
 
-
-
+Patient whole-genome sequencing data have been deposited in the European Genome-Phenome Archive (EGA) database under the accession code EGAS00001005783 and is available under standard EGA controlled release.
 
 
 ## Read alignment
