@@ -117,7 +117,7 @@ The resulting list of rare germline variants was curated for deleterious alterat
 
 First we generated a BED file describing a grid of half-overlapping 1000 bp windows covering the entire genome:
 ```
-coverage grid hg38.chrom.sizes 1000 > grid.bed
+copynum grid hg38.chrom.sizes 1000 > grid.bed
 ```
 
 Then we calculated the GC nucleotide content of each window, for use in subsequent GC bias correction:
