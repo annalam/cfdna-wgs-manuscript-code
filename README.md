@@ -200,7 +200,7 @@ This analysis creates a file `PatientA_cn_deconvolution.pdf` showing the subclon
 
 To generate simulated cancer patient `PatientC` with two samples and three cancer cell subpopulations (subclones), we used our script ‘simulate wgs`:
 ```
-simulate wgs PatientC 2
+simulate wgs PatientD 2
 ```
 
 
