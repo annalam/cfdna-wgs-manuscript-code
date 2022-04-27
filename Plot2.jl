@@ -3,16 +3,15 @@ __precompile__()
 
 module Plot2
 
-export figure, RGB, lighter_color
-export line_plot, scatter_plot, bar_plot, violin_plot
-export area_plot, matrix_plot
-export beeswarm_plot, survival_arrow_plot, stacked_bar_plot, box_plot
+export PyPlot, figure, RGB, hex, lighter_color
+export line_plot, scatter_plot, bar_plot, violin_plot, area_plot, matrix_plot
+export beeswarm_plot, stacked_bar_plot, box_plot
 export rectangle, arc, ellipse, errorbar, text
 export xlim, ylim, xticks, yticks, subplot, ylabel, xlabel, title, grid
 export genome_scatter_plot, genome_segments_plot, genome_plot_config
-export suptitle, kde_plot,  genome_kde_plot, genome_plot_annotation, get_ylim, get_xlim
+export suptitle, kde_plot,  genome_kde_plot, genome_plot_annotation, get_ylim, get_xlim, arrow_plot, histogram_plot
 
-using Helpers, Printf, Survival, DelimitedFiles, CopyNum
+using Helpers, Printf, DelimitedFiles, CopyNum
 import PyCall
 
 global PyPlot = nothing;
@@ -52,17 +51,17 @@ end
 
 figure(block::Function; kwargs...) = figure(block, expanduser("~/plot.pdf"); kwargs...)
 
-xlabel(label::String) = PyPlot.xlabel(label)
-ylabel(label::String) = PyPlot.ylabel(label)
-function title(text::String; offset=0, location="center", size="large")
+xlabel(label::AbstractString) = PyPlot.xlabel(label)
+ylabel(label::AbstractString) = PyPlot.ylabel(label)
+function title(text::AbstractString; offset=0, location="center", size="large")
 	PyPlot.title(text, pad=offset, loc=location, size=size)
 end
 
-function suptitle(text::String; fontsize=15)
+function suptitle(text::AbstractString; fontsize=15)
 	PyPlot.suptitle(text, fontsize=fontsize)
 end
 
-function xticks(ticks::AbstractVector; rotation=90, spine=true, grid=false, labels=nothing)
+function xticks(ticks::AbstractVector; rotation=90, spine=true, grid=nothing, labels=nothing)
 	if all(x -> x isa AbstractString, ticks)
 		PyPlot.xticks(1:length(ticks), ticks, rotation=rotation)
 		PyPlot.tick_params(axis="x", length=0)
@@ -71,9 +70,9 @@ function xticks(ticks::AbstractVector; rotation=90, spine=true, grid=false, labe
 	end
 	PyPlot.gca().spines["bottom"].set_visible(spine)
 	PyPlot.gca().spines["top"].set_visible(false)
-	if grid
+	if grid == true
 		PyPlot.grid(true, axis="x", linestyle="dashed")
-	else
+	elseif grid == false
 		PyPlot.grid(false, axis="x")
 	end
 	if labels != nothing
@@ -81,7 +80,7 @@ function xticks(ticks::AbstractVector; rotation=90, spine=true, grid=false, labe
 	end
 end
 
-function yticks(ticks::AbstractVector; spine=true, grid=false, labels=nothing)
+function yticks(ticks::AbstractVector; spine=true, grid=nothing, labels=nothing)
 	if all(x -> x isa AbstractString, ticks)
 		PyPlot.yticks(1:length(ticks), ticks)
 		PyPlot.tick_params(axis="y", length=0)
@@ -90,9 +89,9 @@ function yticks(ticks::AbstractVector; spine=true, grid=false, labels=nothing)
 	end
 	PyPlot.gca().spines["left"].set_visible(spine)
 	PyPlot.gca().spines["right"].set_visible(false)
-	if grid
+	if grid == true
 		PyPlot.grid(true, axis="y", linestyle="dashed")
-	else
+	elseif grid == false
 		PyPlot.grid(false, axis="y")
 	end
 	if labels != nothing
@@ -125,8 +124,13 @@ function subplot(panel::Integer, rows::Integer)
 	PyPlot.subplot(rows, 1, panel)
 end
 
-function subplot(panel::Integer; rows::Integer=1, cols::Integer=1)
-	PyPlot.subplot(rows, cols, panel)
+#function subplot(panel::Integer; rows::Integer=1, cols::Integer=1)
+#	PyPlot.subplot(rows, cols, panel)
+#end
+
+function subplot(panel::Tuple{Integer, Integer}; rows::Integer=1, cols::Integer=1, 
+                 rowspan::Integer=1, colspan::Integer=1)
+	PyPlot.subplot2grid((rows, cols), panel .- 1, rowspan=rowspan, colspan=colspan)
 end
 
 struct RGB; r::UInt8; g::UInt8; b::UInt8; end
@@ -160,7 +164,8 @@ function errorbar(args...; kwargs...)
 end
 
 function genome_plot_config(chr_names, chr_lens)
-	PyPlot.grid(true, axis="both", which="major", linestyle="dashed")
+	PyPlot.grid(true, axis="x", which="major", linestyle="dashed")
+	PyPlot.grid(false, axis="y", which="both")   # No y-axis grid lines
 	PyPlot.xlim(0, sum(chr_lens))
 	PyPlot.tick_params(axis="x", which="both", length=0)
 	PyPlot.gca().set_xticks(cumsum(chr_lens))
@@ -171,7 +176,7 @@ function genome_plot_config(chr_names, chr_lens)
 		for chr in chr_names], minor=true)
 end
 
-function genome_scatter_plot(chromosome::Vector{String},
+function genome_scatter_plot(chromosome::AbstractVector,
 	position::AbstractVector, value::AbstractVector;
 	chr_sizes="~/homo_sapiens/hg38.chrom.sizes", color=RGB(0), line=false)
 
@@ -188,7 +193,7 @@ function genome_scatter_plot(chromosome::Vector{String},
 	figure() do
 		if line
 			order = sortperm(gpos)
-			line_plot(gpos[order], value[order], color=color)
+			area_plot(gpos[order], value[order], color=color)
 		else
 			scatter_plot(gpos, value, color=color)
 		end
@@ -208,11 +213,12 @@ function genome_segments_plot(segments::Vector{Segment},
 		for c in 1:length(chr_names))
 
 	figure() do
-		for (seg, value) in zip(segments, seg_values)
+		for (i, (seg, value)) in enumerate(zip(segments, seg_values))
 			start = chr_start[seg.chromosome] + seg.start
 			stop = chr_start[seg.chromosome] + seg.stop
+			c = typeof(color) <: AbstractVector ? color[i] : color
 			line_plot([start, stop], fill(value, 2),
-				color=color, line_width=line_width)
+					color=c, line_width=line_width)
 		end
 		genome_plot_config(chr_names, chr_lens)
 	end
@@ -308,6 +314,7 @@ function scatter_plot(x::AbstractVector, y::AbstractVector;
 
 		if grid == true
 			PyPlot.grid(true, axis="both", linestyle="dashed")
+				#color=hex.(RGB(220)), linewidth=0.1)
 		else
 			PyPlot.grid(false)
 		end
@@ -355,7 +362,7 @@ function stacked_bar_plot(values::AbstractMatrix; box_width=0.8, colors=[])
 		PyPlot.gca().spines["right"].set_visible(false)
 
 		for level in 1:L
-			PyPlot.bar(1:B, values[:, level], bottom=bottoms, color=hex(colors[level]), zorder=10)
+			PyPlot.bar(1:B, values[:, level], width=box_width, bottom=bottoms, color=hex(colors[level]), zorder=10)
 			bottoms .+= values[:, level]
 		end
 	end
@@ -367,26 +374,49 @@ function box_plot(groups...; show_means=false, show_outliers=true)
 	end
 end
 
-function area_plot(x::AbstractVector, y::AbstractVector; xbottom=nothing, ybottom=nothing, color=RGB(0))
+function area_plot(x::AbstractVector, y::AbstractVector; xbottom=nothing, ybottom=nothing, 
+			color=RGB(0), alpha=1.0, zorder=1)
 
 	figure() do
 		if xbottom == nothing && ybottom == nothing
-			PyPlot.fill_between(x, y, facecolor=hex(color))
+			PyPlot.fill_between(x, y, facecolor=hex(color), alpha=alpha, zorder=zorder)
 		end
 		if xbottom isa Number || xbottom isa AbstractVector
-			PyPlot.fill_betweenx(y, xbottom, x, facecolor=hex(color))
+			PyPlot.fill_betweenx(y, xbottom, x, facecolor=hex(color), alpha=alpha, zorder=zorder)
 		end
 		if ybottom isa Number || ybottom isa AbstractVector
-			PyPlot.fill_between(x, ybottom, y, facecolor=hex(color))
+			PyPlot.fill_between(x, ybottom, y, facecolor=hex(color), alpha=alpha, zorder=zorder)
 		end
 	end
 end
 
-#function histogram_plot(values::Array; path="~/plot.pdf")
-	#centers =
-	#_, h = hist(values, edges); centers = edges[1:end-1] + step(edges) / 2
-	#histogram_plot(values, path=path, box_width=1.0)
-#end
+function histogram_plot(x; bins=nothing, bwidth=nothing, color=Plot2.RGB(0), alpha=1.0,
+					height=nothing, ybottom=0)
+	min, max = minimum(x), maximum(x)
+	if bwidth!=nothing && max-min < bwidth
+		bins = [max]
+	else
+		bins = collect(range(min, max, length=bins, step=bwidth))[2:end]
+		bwidth = bwidth==nothing ? bins[2]-bins[1] : bwidth
+		bins = vcat(bins, bins[end]+bwidth)
+	end
+	bincounts = zeros(length(bins))
+	x = sort(x)
+	b = 1
+	for xx in x
+		while xx>bins[b]
+			b+=1
+		end
+		bincounts[b] += 1
+	end
+	if height!=nothing
+		bincounts ./= maximum(bincounts) / height
+	end
+	bincounts .+= ybottom
+	bins = hcat(bins.-bwidth, bins)'[:]
+	bincounts = [bincounts[ceil(Int, i/2)] for i=1:2*length(bincounts)]
+	area_plot(bins, bincounts, ybottom=ybottom, color=color, alpha=alpha)
+end
 
 function violin_plot(bins::AbstractVector, density::AbstractArray; colors=[], halved=false)
 
@@ -421,10 +451,12 @@ function violin_plot(bins::AbstractVector, density::AbstractArray; colors=[], ha
 	end
 end
 
-function rectangle(x1::Real, x2::Real, y1::Real, y2::Real; edge_width=0, color=RGB(0, 0, 0), opacity=1.0)
+function rectangle(x1::Real, x2::Real, y1::Real, y2::Real; 
+			edge_width=0, color=RGB(0, 0, 0), opacity=1.0, zorder=1)
 	width = abs(x2 - x1); height = abs(y2 - y1);
 	x = min(x1, x2); y = min(y1, y2);
-	rect = PyPlot.matplotlib.patches.Rectangle((x, y), width, height, linewidth=edge_width, facecolor=hex(color), alpha=opacity)
+	rect = PyPlot.matplotlib.patches.Rectangle((x, y), width, height, linewidth=edge_width, 
+					facecolor=hex(color), alpha=opacity, zorder=zorder)
 	PyPlot.gca().add_patch(rect)
 end
 
@@ -455,36 +487,13 @@ function beeswarm_plot(groups...; point_size=2, color=RGB(0,0,0))
 	end
 end
 
-function survival_arrow_plot(survival::Vector{SurvivalTime}; color=RGB(0,0,0), start_time=[], head_length=NaN)
-
-	S = length(survival)
-	max_time = maximum(abs.(survival))
-	if isnan(head_length); head_length = max_time / 20; end
-
-	if isa(color, RGB); color = fill(color, S); end
-
-	if isempty(start_time)
-		start_time = zeros(S)
-	end
-
-	figure() do
-		PyPlot.xlim(0.5, S + 0.5)
-		PyPlot.ylim(0, max_time * 1.1)
-		PyPlot.tick_params(axis="x", length=0)
-		PyPlot.grid(true, axis="y", linestyle="dashed")
-		PyPlot.gca().spines["top"].set_visible(false)
-		PyPlot.gca().spines["right"].set_visible(false)
-
-		for s in 1:S
-			if survival[s] == event(0); continue; end
-			PyPlot.arrow(s, start_time[s], 0, abs(survival[s]),
-				color=hex(color[s]), width=0.3,
-				head_width=(is_censored(survival[s]) ? 0.8 : 0),
-				head_length=(is_censored(survival[s]) ? head_length : 0))
-		end
-	end
+function arrow_plot(x, y, dx, dy; width=0.001, 
+    head_width=3*width, head_length=1.5*head_width,
+    color=RGB(0), zorder=2, length_includes_head=false)
+        PyPlot.arrow(x, y, dx, dy, width=4e6, head_width=head_width, 
+        head_length=head_length, color=Plot2.hex(color), zorder=zorder, 
+        length_includes_head=length_includes_head)
 end
-
 
 export MatrixLayer, matrix_plot
 export GLYPH_NONE, GLYPH_TILE, GLYPH_SQUARE, GLYPH_SQUARE_BELOW, GLYPH_SQUARE_ABOVE, GLYPH_HORIZONTAL_BOX
@@ -542,5 +551,20 @@ function matrix_plot(layers::Array{MatrixLayer}; path="~/plot.svg", cell_width=5
 end
 
 matrix_plot(layer::MatrixLayer; kwargs...) = matrix_plot([layer]; kwargs...)
+
+
+
+
+############
+# PALETTES #
+############
+
+export GROUP_PALETTE;
+const GROUP_PALETTE = [RGB(255, 0, 0), RGB(0, 0, 255), RGB(0, 204, 0),
+	RGB(255, 0, 255), RGB(255, 153, 51), RGB(0, 230, 230), RGB(230, 230, 0),
+	RGB(51, 153, 255), RGB(174, 230, 100), RGB(255, 0, 127), RGB(255, 153, 153),
+	RGB(153, 51, 255), RGB(184, 134, 11), RGB(128, 128, 200),
+	RGB(238, 130, 238), RGB(75, 0, 130)];
+
 
 end

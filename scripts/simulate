@@ -1,0 +1,338 @@
+#!/bin/env julia
+
+using Helpers, CLI, Distributions, Printf, CopyNum, Plot2
+
+mutable struct Mutation
+	id::Int32
+	maternal::Bool  # Present on maternal or paternal allele?
+	macn::Int8      # Mutant allele copy number
+end
+
+# We partition the genome of each population into 1 Mb blocks. Each block
+# has its own allele-specific copy number state.
+mutable struct Block
+	chr::Int8
+	start_pos::Int32
+	cn_paternal::Int8
+	cn_maternal::Int8
+	arm::Int8            # 0 = centromere, 1 = p-arm, 2 = q-arm
+	mutations::Vector{Mutation}
+end
+
+mutable struct Population
+	parent::Int
+	blocks::Vector{Block}
+end
+
+rand_allele(block::Block) = rand() < block.cn_maternal / (block.cn_maternal + block.cn_paternal)
+
+function mutate!(pop::Population)
+	while true
+		# Generate a CNA at 0.5% probability, a point mutation at 99.5%
+		if rand() < 0.005
+			change = rand() < 0.5 ? -1 : 1   # 50/50 chance of gain/deletion
+			chr = rand(1:22)                 # Affected chromosome
+			if rand() < 0.5      # Whole chromosome CNA
+				blocks = filter(b -> b.chr == chr && b.arm != 0, pop.blocks)
+			else
+				# Chromosome arm CNA
+				arm = rand(1:2)
+				blocks = filter(b -> b.chr == chr && b.arm == arm, pop.blocks)
+				if !isempty(blocks) && rand() < 0.5
+					# Simulate a CNA that only affects a small region
+					blocks = rand() < 0.5 ? blocks[1:rand(1:length(blocks))] :
+						blocks[rand(1:length(blocks)):end]
+				end
+			end
+
+			if isempty(blocks); continue; end
+
+			# Randomize which parental allele is affected
+			maternal = rand_allele(blocks[1])
+
+			# Make large homozygous deletions impossible
+			if change < 0 && count(b -> b.cn_maternal + b.cn_paternal <= 1, blocks) > 10; continue; end
+
+			# Do not modify zero copy regions
+			filter!(b -> (maternal ? b.cn_maternal : b.cn_paternal) > 0, blocks)
+
+			if isempty(blocks); continue; end
+
+			for block in blocks
+				if maternal
+					for mut in block.mutations
+						if mut.maternal && rand() < mut.macn / block.cn_maternal
+							mut.macn += change
+						end
+					end
+					block.cn_maternal += change
+				else
+					for mut in block.mutations
+						if !mut.maternal && rand() < mut.macn / block.cn_paternal
+							mut.macn += change
+						end
+					end
+					block.cn_paternal += change
+				end
+			end
+
+		else
+			# Randomize the genomic block within which the mutation occurs.
+			valid = [b.arm != 0 for b in pop.blocks]  # Avoid centromeres
+			total = sum(b.cn_paternal + b.cn_maternal for b in pop.blocks[valid])
+			block = rand(Categorical([(b.cn_paternal + b.cn_maternal) / total for b in pop.blocks[valid]]))
+			push!(pop.blocks[block].mutations, Mutation(rand(0:999_999_999),
+				rand_allele(pop.blocks[block]), 1))
+		end
+		break   # Successfully mutated the genome
+	end
+end
+
+function duplicate_genome!(pop::Population)
+	for block in pop.blocks
+		block.cn_paternal *= 2
+		block.cn_maternal *= 2
+		for mut in block.mutations; mut.macn *= 2; end
+	end
+end
+
+function wgs(patient::String, num_samples::Int; depth=200, logratio_stdev=0.7,
+	maf_threshold=0.1, mutant_read_threshold=8)
+
+	# Generate a germline genome
+	d = readtsv("~/homo_sapiens/hg38.chrom.sizes")
+	centromeres = readtsv("~/homo_sapiens/centromeres_hg38.bed")
+	germline = Block[]
+	for c in 1:22
+		chr_len = Int(d[c, 2])
+		centro_start = Int(centromeres[c, 2])
+		centro_end = Int(centromeres[c, 3])
+		for pos in 500_000:1_000_000:chr_len
+			if centro_start <= pos <= centro_end
+				arm = 0
+			else pos < centro_start
+				arm = pos < centro_start ? 1 : 2
+			end
+			push!(germline, Block(c, pos, 1, 1, arm, []))
+		end
+	end
+
+	# Assign sample names
+	samples = [@sprintf("%s-%02d", patient, s) for s in 1:num_samples]
+	S = length(samples)
+
+	# Assign a randomized cancer fraction and diploid level for each sample
+	cancer_frac = [rand(Uniform(0.3, 0.8)) for s in 1:S]
+	diploid_level = rand(Uniform(-0.5, 0.5))
+	#cancer_frac = [rand(Uniform(0.01, 0.10)) for s in 1:S]
+	#diploid_level = 0
+
+	# Generate a phylogenetic tree of populations
+	# First we generate the truncal branch
+	trunk = Population(0, deepcopy(germline))   # Truncal node
+	for k in 1:rand(1000:5000); mutate!(trunk); end
+	if rand() < 0.5; duplicate_genome!(trunk); end
+	for k in 1:rand(1000:5000); mutate!(trunk); end
+
+	subclone = Population(1, deepcopy(trunk.blocks))
+	for k in 1:rand(500:3000); mutate!(subclone); end
+	tiny_clone = Population(1, deepcopy(trunk.blocks))
+	for k in 1:rand(1000:5000); mutate!(tiny_clone); end
+
+	populations = [trunk, subclone, tiny_clone]
+	P = length(populations)
+
+	@assert(all(b -> b.cn_paternal >= 0 && b.cn_maternal >= 0, trunk.blocks))
+
+	# Generate population CCFs for each sample
+	pop_ccf = fill(NaN, S, P)
+	for s in 1:S
+		tiny_frac = rand(Uniform(0.02, 0.15))
+		frac = rand(Uniform(0, 1 - tiny_frac))
+		pop_ccf[s, 1] = 1 - frac - tiny_frac
+		pop_ccf[s, 2] = frac
+		pop_ccf[s, 3] = tiny_frac
+	end
+
+	# Print the ground truth information
+	out = open("$(patient).txt", "w")
+	for s in 1:S
+		@printf(out, "Diploid level: %.2f\n", diploid_level)
+		@printf(out, "Sample %s with cancer fraction %.1f%%:\n", samples[s],
+			cancer_frac[s] * 100)
+		for p in 1:P
+			@printf(out, "- Population %d: %.1f%% CCF\n",
+				p, pop_ccf[s, p] * 100)
+		end
+	end
+
+	# Generate coverage logratios for each sample
+	for s in 1:S
+		out = open("$(samples[s])_logratio.igv", "w")
+		@printf(out, "CHROM\tSTART\tEND\tFEATURE\t%s\n", samples[s])
+		for (b, block) in enumerate(trunk.blocks), pos in 500:500:999_500
+			if block.arm == 0; continue; end    # Omit centromeres
+			total_cn = sum(pop_ccf[s, p] * (populations[p].blocks[b].cn_paternal + populations[p].blocks[b].cn_maternal) for p in 1:P)
+			expected_lr = cn_to_logratio(total_cn, cancer_frac[s], 2) + diploid_level
+			@printf(out, "chr%d\t%d\t%d\t\t%.3f\n", block.chr,
+				block.start_pos + pos, block.start_pos + pos + 1,
+				rand(Normal(expected_lr, logratio_stdev)))
+		end
+		close(out)
+	end
+
+	# Generate heterozygous SNP allele fractions for each sample
+	for s in 1:S
+		out = open("$(samples[s])_hetz_snp.tsv", "w")
+		println(out, "CHROM\tPOSITION\tALT_FRAC\tDEPTH")
+		for (b, block) in enumerate(trunk.blocks), pos in 10_000:20_000:990_000
+			if block.arm == 0; continue; end    # Omit centromeres
+			total_cn = sum(pop_ccf[s, p] * (populations[p].blocks[b].cn_paternal + populations[p].blocks[b].cn_maternal) for p in 1:P)
+			cn_paternal = sum(pop_ccf[s, p] * populations[p].blocks[b].cn_paternal for p in 1:P)
+			true_hsaf = expected_hsaf(cancer_frac[s], cn_paternal,
+				total_cn)
+
+			cn_adjusted_depth = (cancer_frac[s] * total_cn / 2 * depth) + (1 - cancer_frac[s]) * depth
+
+			noisy_depth = rand(Poisson(cn_adjusted_depth))
+			dist = Binomial(noisy_depth, true_hsaf)
+			@printf(out, "chr%d\t%d\t%.5f\t%d\n", block.chr,
+				block.start_pos + pos,
+				median([0.5 + abs(0.5 - rand(dist) / noisy_depth)
+					for k in 1:9]),
+				depth)
+		end
+		close(out)
+	end
+
+	# Generate somatic mutations for each sample
+	out = open("$(patient)_somatic.vcf", "w")
+	@printf(out, "CHROM\tPOSITION\tREF\tALT\tGENE\tEFFECT\tNOTES\t%s\n",
+		join(samples, '\t'))
+	for (b, block) in enumerate(trunk.blocks)
+
+		pop_cn = [p.blocks[b].cn_paternal + p.blocks[b].cn_maternal for p in populations]
+
+		uniq_id = Int32[]
+		for p in 1:P, mut in populations[p].blocks[b].mutations
+			push!(uniq_id, mut.id)
+		end
+		uniq_id = unique(uniq_id)
+
+		positions = sort([rand(0:999_999) for k in 1:length(uniq_id)])
+
+		for (mut_id, position) in zip(uniq_id, positions)
+			pop_macn = zeros(Int, P)
+			for p in 1:P
+				for m in populations[p].blocks[b].mutations
+					if m.id == mut_id; pop_macn[p] = m.macn; end
+				end
+			end
+
+			mut_reads = zeros(Int, S)
+			total_reads = zeros(Int, S)
+			for s in 1:S
+				total_cn = sum(pop_ccf[s, :] .* pop_cn)
+				total_macn = sum(pop_ccf[s, :] .* pop_macn)
+
+				cn_adjusted_depth = (cancer_frac[s] * total_cn / 2 * depth) + (1 - cancer_frac[s]) * depth
+
+				noisy_depth = rand(Poisson(cn_adjusted_depth))
+
+				true_maf = total_macn * cancer_frac[s] / (cancer_frac[s] * total_cn + (1 - cancer_frac[s]) * 2)
+
+				mut_reads[s] = rand(Binomial(noisy_depth, true_maf))
+				total_reads[s] = noisy_depth
+			end
+
+			# Don't show a mutation if it doesn't pass detection thresholds
+			# in any sample
+			if !any(s -> mut_reads[s] >= mutant_read_threshold && mut_reads[s] / total_reads[s] >= maf_threshold, 1:S); continue; end
+
+			@printf(out, "chr%d\t%d\tA\tT\t\t\t", block.chr, block.start_pos + position)
+			for s in 1:S
+				@printf(out, "\t%d:%d:*", mut_reads[s], total_reads[s])
+			end
+			print(out, '\n')
+		end
+	end
+	close(out)
+
+	#println("- Writing results into TSV file...")
+	#for s in 1:length(samples)
+	#	out = open("$(samples[s])_segments.txt", "w")
+	#	println(out, "CHR\tSTART\tEND\tLOGRATIO\tLOGRATIO_VAR\tHSAF\tHSAF_STDEV\tMEDIAN_DEPTH")
+	#	for seg in segments[:, s]
+	#		@printf(out, "%s\t%d\t%d", seg.chromosome, seg.start, seg.stop)
+	#		@printf(out, "\t%.5f\t%.5f", seg.logratio, seg.logratio_var)
+	#		@printf(out, "\t%.5f\t%.5f", seg.hsaf, seg.hsaf_stdev)
+	#		@printf(out, "\t%d\n", seg.depth)
+	#	end
+	#	close(out)
+	#end
+
+	# Write the ground truth CN state into a file
+	d = readtsv("~/homo_sapiens/hg38.chrom.sizes")
+	CHR_NAMES = String.(d[:, 1])
+	CHR_SIZES = Int64.(d[:, 2])
+	CHR_STARTS = cumsum(CHR_SIZES) .- CHR_SIZES
+
+	# Generate a figure of subclonal CN profiles
+	figure("$(patient)_cn_profiles.pdf", size=(15, 3 * P)) do 
+		for p in 1:P
+			subplot(p, P)
+			blocks = populations[p].blocks
+			start_pos = blocks[1].start_pos
+			chr = blocks[1].chr
+			cn = (blocks[1].cn_paternal, blocks[1].cn_maternal)
+			for k in 1:length(blocks)
+				new_cn = (blocks[k].cn_paternal, blocks[k].cn_maternal)
+				if blocks[k].arm == 0 || blocks[k].chr != chr || new_cn != cn
+					if blocks[k - 1].arm == 0; continue; end
+					
+					chr_start = CHR_STARTS[findone(CHR_NAMES, "chr$(chr)")]
+					end_pos = blocks[k - 1].start_pos
+					area_plot([chr_start + start_pos, chr_start + end_pos],
+						[sum(cn) + 0.2, sum(cn) + 0.2], ybottom=sum(cn))
+                    area_plot([chr_start + start_pos, chr_start + end_pos],
+                    	[cn[1], cn[1]], color=RGB(100, 100, 255))
+                    area_plot([chr_start + start_pos, chr_start + end_pos],
+                    	[sum(cn), sum(cn)], ybottom=cn[1], color=RGB(255, 100, 100))
+
+                    chr = blocks[k].chr
+                    start_pos = blocks[k].start_pos
+                    cn = new_cn
+				end
+			end
+
+			genome_plot_config(CHR_NAMES[1:22], CHR_SIZES[1:22])
+			xlim(0, CHR_STARTS[22]+CHR_SIZES[22])
+		end
+	end
+
+	# Generate a text file of subclonal CN profiles
+	out = open("$(patient)_cn_profiles.tsv", "w")
+	blocks = populations[1].blocks
+	start_pos = blocks[1].start_pos
+	chr = blocks[1].chr
+	cn = [(populations[p].blocks[1].cn_paternal, populations[p].blocks[1].cn_maternal) for p in 1:P]
+	for k in 1:length(blocks)
+		new_cn = [(populations[p].blocks[k].cn_paternal, populations[p].blocks[k].cn_maternal) for p in 1:P]
+		if blocks[k].arm == 0 || blocks[k].chr != chr || new_cn != cn
+			if blocks[k - 1].arm == 0; continue; end
+
+			end_pos = blocks[k - 1].start_pos
+			@printf(out, "chr%s\t%d\t%d", chr, start_pos, end_pos)
+			for p in 1:P; @printf(out, "\t%d+%d", cn[p][1], cn[p][2]); end
+			@printf(out, "\n")
+
+			chr = blocks[k].chr
+			start_pos = blocks[k].start_pos
+			cn = new_cn
+		end
+	end
+	close(out)
+end
+
+
+subcommands(wgs)

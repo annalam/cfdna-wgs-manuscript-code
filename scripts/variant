@@ -1,0 +1,768 @@
+#!/bin/env julia
+
+using Helpers, CLI, Printf, DelimitedFiles, Serialization, Distributions
+using Variant
+
+# Print comment lines to stdout and return first non-comment line
+function skip_to_header(vcf_file)
+	while true
+		line = readline(vcf_file); 
+		if !startswith(line, "#") return line; end		
+		println(line);
+	end
+end
+
+drop_chr_prefix(chr) = startswith(chr, "chr") ? chr[4:end] : chr
+
+function somatic(vcf_file::IO, samples_file::IO; alt_reads=3, alt_frac=0.1, 
+	test_ref_ratio=5, test_bg_ratio=20, test_bg_alpha=1.0, ref_reads=0,
+	keep_all=false, min_mapq=10, min_sidedness=10, min_avg_depth=0,mapq_filter_max_indel_len=5, keep_old_stars::Bool=false)
+
+	header = skip_to_header(vcf_file); println(header)
+	header_cols = split(header, '\t')
+	notes_col = findone(header_cols, "NOTES")
+	@assert(header_cols[3] == "REF")
+	@assert(header_cols[4] == "ALT")
+
+	samples = header_cols[notes_col+1:end]
+	n_samples = length(samples)
+
+	# Read samples file and separate the row header
+	d = readdlm(samples_file, '\t')
+	sample_file_header = d[1, :][:]
+	d = d[2:end, :]
+	@assert(sample_file_header[1] == "TEST")
+	@assert(sample_file_header[2] == "REF")
+	alt_frac_col = findone(sample_file_header, "ALT_FRAC")
+	alt_reads_col = findone(sample_file_header, "ALT_READS")
+	oxidative_col = findone(sample_file_header, "OXIDATIVE_FRAC")
+
+	# Check that all requisite samples are found in the VCF file exactly once
+	for sample in filter(s -> s != "", d[:, 1:2][:])
+		if !(sample in samples)
+			error("Sample $(sample) is missing from the VCF file.")
+		end
+		if sum(samples .== sample) > 1
+			error("Sample $(sample) is found multiple times in the VCF file.")
+		end
+	end
+
+	# Background error is estimated based on paired *and* unpaired reference
+	# samples.
+	background = [findone(samples, s) for s in unique(d[:, 2]) if s != ""]
+
+	# Get indices of test and ref sample rows in the samples file
+	test = zeros(Int, 0); paired_ref = zeros(Int, 0);
+	min_alt_frac = zeros(0); min_alt_reads = zeros(0);
+	oxidative_frac = zeros(0);
+	for r in 1:size(d, 1)
+		if d[r, 1] == ""; continue; end
+		push!(test, findone(samples, d[r, 1]))
+		if d[r, 2] == ""
+			push!(paired_ref, 0)
+		else
+			push!(paired_ref, findone(samples, d[r, 2]))
+		end
+
+		# Read sample-specific thresholds from the design file if specified.
+		push!(min_alt_frac, alt_frac_col == nothing ? alt_frac :
+			d[r, alt_frac_col])
+		push!(min_alt_reads, alt_reads_col == nothing ? alt_reads :
+			d[r, alt_reads_col])
+		push!(oxidative_frac, oxidative_col == nothing || d[r, oxidative_col] == "" ? 0 : d[r, oxidative_col])
+	end
+
+	info("Analyzing $(length(test)) samples for somatic mutations...")
+
+	if !isempty(intersect(background, test))
+		warn("Some background reference samples also used as test samples.")
+	end
+	info("Calculating background error rate based on $(length(background)) samples...")
+
+	for line in eachline(vcf_file)
+		cols = split(line, '\t')
+		if length(cols) != notes_col + n_samples
+			warn("Line has wrong columns ($(length(cols)) != $notes_col + $n_samples):\n$line")
+			continue
+		end
+		alt = zeros(Int32, n_samples)
+		total = zeros(Int32, n_samples)
+		# CALL2 support
+		mapq = zeros(Int32, n_samples)
+		sidedness = zeros(Int32, n_samples)
+
+		call2_format = false
+		is_indel = length(cols[3]) != length(cols[4])
+
+		for s in 1:n_samples
+			col = cols[notes_col + s]
+			gt = split(cols[notes_col + s], ':')
+			alt[s] = parse(Int32, gt[1])
+			total[s] = parse(Int32, gt[2])
+			# CALL2 support
+			if length(gt) >= 5
+				mapq[s] = parse(Int32, gt[3])
+				#baseq[s] = parse(Int32, gt[4])
+				sidedness[s] = parse(Int32, gt[5])
+				call2_format = true
+			end
+		end
+
+		fracs = alt ./ total
+		bg_alt = sum(alt[background])
+		bg_total = sum(total[background])
+		avg_ref_frac = bg_alt / bg_total
+
+		if min_avg_depth > 0 && mean(total) < min_avg_depth && !keep_all
+			continue
+		end
+
+		somatic = falses(n_samples)
+		for k in 1:length(test)
+			t = test[k]        # Index of test sample col
+			r = paired_ref[k]  # Index of ref sample col
+
+			# Perform checks to determine somatic status of mutation
+			if fracs[t] < min_alt_frac[k]; continue; end
+			if alt[t] < min_alt_reads[k]; continue; end
+
+			if fracs[t] < test_bg_ratio * avg_ref_frac; continue; end
+
+			# Remove oxidative DNA damage if requested by user
+			if oxidative_frac[k] > 0 && fracs[t] < oxidative_frac[k] &&
+				((cols[3] == "G" && cols[4] == "T") ||
+				(cols[3] == "C" && cols[4] == "A"))
+				continue
+			end
+
+			if r != 0 && total[r] < ref_reads; continue; end
+			if r != 0 && fracs[t] < test_ref_ratio * fracs[r]; continue; end
+
+			if call2_format
+				indel_len = abs(length(cols[3]) - length(cols[4]))
+				if mapq[t] < min_mapq &&
+					indel_len <= mapq_filter_max_indel_len; continue; end
+				if !is_indel && mapq[t] < min_mapq; continue; end 
+				if sidedness[t] < min_sidedness; continue; end 
+			end
+
+			somatic[t] = true
+		end
+
+		if keep_old_stars
+			somatic |= map(c -> endswith(c, '*'), cols[notes_col+1:end])
+		end
+
+		if !any(somatic) && keep_all == false; continue; end
+		
+		print(join(cols[1:notes_col], '\t'))
+		@printf("BG: %.3f%%. ", avg_ref_frac * 100)
+		for s in 1:n_samples
+			if call2_format
+				print("\t$(alt[s]):$(total[s]):$(mapq[s]):0:$(sidedness[s])")
+			else 
+				print("\t$(alt[s]):$(total[s])")
+			end
+
+			if somatic[s]; print(":*"); end
+		end
+		println()
+	end
+end
+
+function germline(vcf_file::IO, ref_regexps...; alt_reads=5, alt_frac=0.15, bg_ratio=20)
+	line = skip_to_header(vcf_file); println(line)
+	sample_col = findone(split(line, '\t'), "NOTES") + 1
+	samples = split(line, '\t')[sample_col:end]
+
+	ref_regexps = map(Regex, ref_regexps)  # Compile the regular expressions
+	germline = [any(rx -> rx in s, ref_regexps) for s in samples]
+
+	for line in eachline(vcf_file)
+		cols = split(line, '\t')
+		gtypes = [split(c, ':') for c in cols[sample_col:end]]
+		total = [parse(Int32, gt[2]) for gt in gtypes]
+		alt = [parse(Int32, gt[1]) for gt in gtypes]
+		fracs = alt ./ total
+		alt_gt = (fracs .>= alt_frac) .& (alt .>= alt_reads) .& germline
+		if !any(alt_gt); continue; end
+
+		# There might be non-reference samples that are not in alt_gt because
+		# of the alt_reads threshold. We don't want to include these
+		# samples in the background, so we only use alt_frac when picking
+		# background samples.
+		avg_alt = sum(alt[alt_gt]) / sum(total[alt_gt])
+		bg = (fracs .< alt_frac) .& germline
+		avg_ref = sum(alt[bg]) / sum(total[bg])
+		if avg_alt / avg_ref < bg_ratio; continue; end
+
+		print(join(cols[1:sample_col-1], '\t'))
+		for s in 1:length(total)
+			print("\t$(alt[s]):$(total[s])")
+			if alt_gt[s]; print(":*"); end
+		end
+		print('\n')
+	end
+end
+
+function above_background(vcf_file::IO, ref_regex...; alt_reads=3, alt_frac=0.1, bg_ratio=20)
+	line = skip_to_header(vcf_file); println(line)
+	sample_col = findone(split(line, '\t'), "NOTES") + 1
+	samples = split(line, '\t')[sample_col:end]
+
+	bg = falses(samples)
+	for regex in ref_regex; bg .|= ismatch.(Regex(regex), samples); end
+	info("Calculating background based on $(sum(bg)) samples...")
+
+	for line in eachline(vcf_file)
+		cols = split(line, '\t')
+		gtypes = map(c -> split(c, ':'), cols[sample_col:end])
+		total = map(gt -> parse(Int, gt[2]), gtypes)
+		alt = map(gt -> parse(Int, gt[1]), gtypes)
+		fracs = alt ./ total
+		avg_bg_frac = sum(alt[bg]) / sum(total[bg])
+		alt_gt = (alt .>= alt_reads) .&
+			(fracs .>= max(alt_frac, avg_bg_frac * bg_ratio))
+		if !any(alt_gt); continue; end
+
+		print(join(cols[1:sample_col-1], '\t'))
+		for s in 1:length(total)
+			print("\t$(alt[s]):$(total[s])")
+			if alt_gt[s]; print(":*"); end
+		end
+		println()
+	end
+end
+
+function heterozygous_snps(vcf_file::IO, ref_regex...; min_depth=20, max_depth=Inf, bg_fraction=0.1, min_mapq=10, min_sidedness=10)
+	line = skip_to_header(vcf_file); println(line)
+	sample_col = findone(split(line, '\t'), "NOTES") + 1
+	samples = split(line, '\t')[sample_col:end]; S = length(samples)
+
+	ref_regex = map(Regex, ref_regex)  # Compile the regular expressions
+	ref = [any(rx -> rx in s, ref_regex) for s in samples]
+
+	info("Searching for heterozygous SNPs in $(sum(ref)) germline samples...")
+
+	for line in eachline(vcf_file)
+		cols = split(line, '\t')
+		starred = falses(S)
+		#unclear = 0
+		for (s, col) in enumerate(cols[sample_col:end])
+			parts = split(col, ':')
+			alt = parse(Int, parts[1])
+			total = parse(Int, parts[2])
+			if ref[s] == false; continue; end
+			if total < min_depth; continue; end
+			if total > max_depth; continue; end
+			if !(0.25 <= alt / total <= 0.75); continue; end
+			
+			if length(parts) >= 5
+				mapq = parse(Int32, parts[3])
+				if mapq < min_mapq; continue; end
+				#baseq[s] = parse(Int32, gt[4])
+				sidedness = parse(Int32, parts[5])
+				if sidedness < min_sidedness; continue; end
+			end
+
+			hetz = Binomial(total, 0.5)
+			if 0.05 <= cdf(hetz, alt) <= 0.95; starred[s] = true; end
+		end
+
+		#if unclear / S >= bg_fraction; continue; end
+		if !any(starred); continue; end
+
+		print(join(cols[1:sample_col-1], '\t'))
+		for (s, col) in enumerate(cols[sample_col:end])
+			unstarred = replace(col, ":*", "")
+			@printf("\t%s%s", unstarred, starred[s] ? ":*" : "")
+		end
+		print('\n')
+	end
+end
+
+#annovar_valid_funcs = Set(["exonic", "splicing", "intergenic", "intronic",
+#	"upstream", "downstream", "UTR5", "UTR3", "ncRNA_exonic", "ncRNA_intronic",
+#	"ncRNA_splicing", "ncRNA_UTR5", ""])
+
+# A mapping from gene names to canonical transcript variant
+canonical_transcripts = Set{String}();
+genes_with_canonical = Set{String}();
+
+function translate_annovar_effect(gene, func, exonic_func, aa_change)
+	if !(r"^((exonic|splicing|intergenic|intronic|upstream|downstream|UTR5|UTR3|ncRNA_exonic|ncRNA_intronic|ncRNA_splicing|ncRNA_UTR5);?)*$" in func)
+		error("Unrecognized variant effect '$func'.")
+	end
+
+	# Build database of canonical transcripts if not already built
+	if isempty(canonical_transcripts)
+		canonical = String[]
+		genes = String[]
+		for r in eachrow(readtsv("/home/annalam/homo_sapiens/uniprot_canonical_isoforms.tsv")[2:end, :])
+			if r[3] == ""; continue; end
+			append!(canonical, split(r[3], ','))
+			push!(genes, r[1])
+		end
+		global canonical_transcripts = Set(canonical)
+		global genes_with_canonical = Set(genes)
+	end
+
+	effects = String[]
+	if "ncRNA_exonic" in func
+		push!(effects, "ncRNA exon")  # Check this before "exonic" below
+	elseif "exonic" in func
+		canonical = falses(0)
+		for effect in split(aa_change, r"[;,] ?")
+			m = match(r"^.+:([NX]M_\d+):.*:p.(.+)", effect)
+			if m == nothing; return (gene, "Unknown"); end
+			transcript = m.captures[1]
+			change = m.captures[2]
+
+			m = match(r"^([A-Z*])\d+(.+)|(\d+_\d+)(del)", change)
+			if m == nothing; return (gene, "Unknown"); end
+			
+			if m.captures[1] == m.captures[2]
+				push!(effects, "Synonymous p.$(change)")
+			elseif "fs" in m.captures[2]
+				push!(effects, "Frameshift p.$(change)")
+			elseif "del" in m.captures[2]
+				push!(effects, "Non-frameshift deletion p.$(change)")
+			elseif "ins" in m.captures[2]
+				push!(effects, "Non-frameshift insertion p.$(change)")
+			elseif m.captures[2] == "*"
+				push!(effects, "Stopgain p.$(change[1:end-1])X")
+			elseif m.captures[2] == "X"
+				push!(effects, "Stopgain p.$(change)")
+			elseif m.captures[2] == "?"
+				push!(effects, "Startloss p.$(change)")
+			elseif m.captures[1] == "X" || m.captures[1] == "*"
+				push!(effects, "Stoploss p.$(change)")
+			elseif length(m.captures[1]) == length(m.captures[2]) == 1
+				push!(effects, "Missense p.$(change)")
+			else
+				return (gene, "Unknown")
+			end
+
+			push!(canonical, transcript in canonical_transcripts)
+		end
+
+		# Only keep canonical isoform effects, if there are any
+		if any(canonical)
+			effects = effects[canonical]
+		elseif gene in genes_with_canonical
+			push!(effects, "Only affects a non-canonical isoform")
+		end
+		effects = unique(effects)
+
+	elseif "UTR3" in func; push!(effects, "3'-UTR");
+	elseif "UTR5" in func; push!(effects, "5'-UTR");
+	elseif "upstream" in func; push!(effects, "Upstream");
+	elseif "downstream" in func; push!(effects, "Downstream");
+	elseif "intronic" in func; push!(effects, "Intronic");
+	elseif "intergenic" in func || func == ""
+		push!(effects, "Intergenic")
+		gene = ""    # TODO: This line needed?
+	end
+
+	if "splicing" in func; pushfirst!(effects, "Splice site"); end
+
+	if isempty(effects); return (gene, "Unknown"); end
+
+	return (gene, join(effects, ". "))
+end
+
+function predict_effect(vcf_file::IO; genome="~/tools/annovar-2019-10-24/humandb/hg38")
+	genome_version = basename(genome)
+	humandb_dir = expanduser(dirname(genome))
+	tmp_prefix = @sprintf("annovar-%04X", rand(0:2^16-1))
+	original_path = "$(tmp_prefix).original"
+	reformatted_path = "$(tmp_prefix).avinput"
+
+	# Reformat the input file to an ANNOVAR-compatible format. In particular,
+	# indels must be changed so they use '-' as the ref or alt allele.
+	# Since the input file could be a pipe, we must write the original VCF
+	# into a separate file that will be used to build the final annotated VCF.
+	original_file = open(original_path, "w")
+	reformatted_file = open(reformatted_path, "w")	
+	headers = split(skip_to_header(vcf_file), '\t')
+	
+	for line in eachline(vcf_file)
+		
+		write(original_file, line, '\n')
+		c = split(line, '\t')
+		start = parse(Int, c[2]); stop = start; ref = c[3]; alt = c[4]
+
+		if length(ref) == 1 && length(alt) > 1 && ref[1] == alt[1]
+			# Simple insertion
+			ref = "-"; alt = alt[2:end];
+		elseif length(ref) > 1 && length(alt) == 1 && ref[1] == alt[1]
+			# Simple deletion
+			ref = ref[2:end]; alt = "-"; start += 1;
+		elseif length(ref) > 1 && length(alt) > 1
+			# Block substitution
+		end
+		stop = start + length(ref) - 1
+		write(reformatted_file, "$(c[1])\t$(start)\t$(stop)\t$(ref)\t$(alt)\n")
+	end
+	close(original_file); close(reformatted_file); close(vcf_file)
+
+	run(pipeline(`table_annovar.pl $(reformatted_path) $(humandb_dir) --buildver $(genome_version) --remove --outfile $(tmp_prefix) --operation g --protocol refGene`, stderr=devnull))
+
+	anno_path = "$(tmp_prefix).$(genome_version)_multianno.txt"
+	original_file = open(original_path);
+	anno_file = open(anno_path); readline(anno_file)
+	print("CHROM\tPOSITION\tREF\tALT\tGENE\tEFFECT\tNOTES\t")
+	println(join(headers[6:end], '\t'))
+	for line in eachline(anno_file)
+		c = split(line, '\t')
+		if length(c) >= 7
+			gene, effect = translate_annovar_effect(c[7], c[6],
+				length(c) >= 9 ? c[9] : "", length(c) >= 10 ? c[10] : "")
+			if effect == "Unknown"
+				warn("Cannot parse protein change:\n$line\n")# '$change' in '$effect'")
+			end
+		else
+			warn("$anno_path contains line with < 7 columns:\n$line\n")
+			gene = ""; effect = "";
+		end
+
+		# Special case for TERT promoter mutations
+		position = parse(Int, c[2])
+		if c[1] == "chr5" && 1_295_069 <= position <= 1_295_568
+			gene = "TERT"
+			effect = "Promoter mutation"
+		end
+
+		orig_line = readline(original_file)
+		m = match(r"^(.*?\t.*?\t.*?\t.*?\t)(.*)$", orig_line)
+		print(m.captures[1])
+		print("$gene\t$effect\t")
+		println(m.captures[2])
+		#tab = findfirst(orig_line, '\t')
+		#for k in 1:3; tab = findfirst(orig_line, '\t', tab + 1); end
+		#print(orig_line[1:tab])
+		#print("$(gene)\t$(effect)\t")
+		#println(orig_line[tab+1:end])
+	end
+	close(anno_file); rm(original_path); rm(reformatted_path); rm(anno_path);
+end
+
+mutable struct ChromAnnotations
+	position::Vector{Int32}
+	change::Vector{Int16}
+	#annotation::Vector{Float32}
+	annotation::Vector
+end
+
+mutable struct Annotations
+	prefix::String
+	chromosomes::Dict{String, ChromAnnotations}
+end
+
+base_num = Dict{String, Int16}("A" => 1, "C" => 2, "G" => 3, "T" => 4)
+function encode_ref_alt(ref, alt)
+	if length(ref) == 1 && length(alt) == 1
+		ref_num = get(base_num, ref, 0)
+		alt_num = get(base_num, alt, 0)
+		if ref_num == 0 || alt_num == 0; return 0; end
+		return ref_num * 16 + alt_num   # Base substitution
+	elseif abs(length(ref) - length(alt)) % 3 == 0
+		return 1     # Non-frameshift indel
+	else
+		return 2     # Frameshift indel
+	end
+end
+
+function build_annotation_database(anno_path, db_path; prefix="",
+	format="text")
+
+	anno_file = open(anno_path)
+	if format == "text"
+		chromosomes = build_annotation_database_text(anno_file)
+	elseif format == "numeric"
+		chromosomes = build_annotation_database_numeric(anno_file)
+	else
+		error("Unrecognized annotation database format '$format' requested.")
+	end
+
+	open(db_path, "w") do f
+		serialize(f, Annotations(prefix, chromosomes))
+	end
+end
+
+function build_annotation_database_text(anno_file)
+	chromosomes = Dict{String, ChromAnnotations}()
+	chr = ""; anno = nothing
+	for line in eachline(anno_file)
+		c = split(line, '\t')
+		if c[1] != chr
+			if anno != nothing
+				@assert(issorted(anno.position))
+				chromosomes[chr] = anno
+			end
+			anno = ChromAnnotations([], [], Vector{String}()); chr = c[1]
+			info("Chromosome $(chr)...")
+		end
+		push!(anno.position, parse(Int32, c[2]))
+		push!(anno.change, encode_ref_alt(c[3], c[4]))
+		push!(anno.annotation, c[5])
+	end
+	chromosomes[chr] = anno
+	return chromosomes
+end
+
+function build_annotation_database_numeric(anno_file)
+	chromosomes = Dict{String, ChromAnnotations}()
+	chr = ""; anno = nothing
+	for line in eachline(anno_file)
+		c = split(line, '\t')
+		if c[1] != chr
+			if anno != nothing
+				@assert(issorted(anno.position))
+				chromosomes[chr] = anno
+			end
+			anno = ChromAnnotations([], [], Vector{Float32}()); chr = c[1]
+			info("Chromosome $(chr)...")
+		end
+		push!(anno.position, parse(Int32, c[2]))
+		push!(anno.change, encode_ref_alt(c[3], c[4]))
+		push!(anno.annotation, parse(Float32, c[5]))
+	end
+	chromosomes[chr] = anno
+	return chromosomes
+end
+
+function annotate(vcf_file::IO, db_path::String)
+	db = open(deserialize, db_path)
+	prefix = db.prefix
+	#format = read(db, "format")
+	headers = split(skip_to_header(vcf_file), '\t')
+	notes_col = findone(headers, "NOTES")
+	println(join(headers, '\t'))
+
+	chr = ""; anno = nothing
+	for line in eachline(vcf_file)
+		c = split(line, '\t')
+		if drop_chr_prefix(c[1]) != chr
+			chr = drop_chr_prefix(c[1])
+			anno = get(db.chromosomes, chr, nothing)
+			if anno == nothing
+				warn("No annotations found for chromosome $(chr).")
+			end
+		end
+		if anno != nothing
+			matches = searchsorted(anno.position, parse(Int32, c[2]))
+			if !isempty(matches)
+				change = encode_ref_alt(c[3], c[4])
+				for m in matches
+					if anno.change[m] == change
+						if anno.annotation[m] isa Float32
+							c[notes_col] *= @sprintf("%s:%g", prefix,
+								anno.annotation[m]) * ". "
+						elseif anno.annotation[m] isa String
+							c[notes_col] *= "$(prefix):$(anno.annotation[m]). "
+						end
+					end
+				end
+			end
+		end
+		println(join(c, '\t'))
+	end
+end
+
+# Filter VCF file lines based on if they are protein altering or not
+# ARG: invert: Set to false to output protein altering mutations"
+#              Set to true to output non protein altering mutations"
+function protein_altering(vcf_file::IO; invert=false)
+	line = skip_to_header(vcf_file); println(line)
+	func_col = findone(split(line, '\t'), "EFFECT")
+	for line in eachline(vcf_file)
+		cols = split(line, '\t')
+		alters = is_protein_altering(cols[func_col])
+		if cols[func_col] == "Promoter mutation"; alters = true; end
+		if !alters == invert; println(line); end
+	end
+end
+
+function select_samples(invert::Bool, vcf_file::IO, regexps...)
+	headers = split(skip_to_header(vcf_file), '\t')
+	sample_col = findone(headers, "NOTES") + 1
+	keep = falses(length(headers))
+	keep[1:sample_col-1] .= true
+	regexps = Regex.(regexps)
+	for col in sample_col:length(headers)
+		keep[col] = any(rx -> rx in headers[col], regexps)
+	end
+	if invert; keep[sample_col:end] = .!keep[sample_col:end]; end
+	println(join(headers[keep], '\t'))
+	for line in eachline(vcf_file)
+		cols = split(line, '\t')
+		keep_row = false
+		for c in sample_col:length(headers)
+			if keep[c] && '*' in cols[c]; keep_row = true; break; end
+		end
+		if keep_row; println(join(cols[keep], '\t')); end
+	end
+end
+keep_samples(vcf_file::IO, regexps...) = select_samples(false, vcf_file, regexps...)
+discard_samples(vcf_file::IO, regexps...) = select_samples(true, vcf_file, regexps...)
+
+function discard_blacklisted(vcf_file::IO, blacklist::IO)
+	d = readdlm(blacklist, '\t', String)
+	blacklist = Set(map(r -> d[r, 1:4][:], 1:size(d, 1)))
+
+	line = skip_to_header(vcf_file); println(line);
+	for line in eachline(vcf_file)
+		c = split(line, '\t')
+		if in(c[1:4], blacklist); continue; end
+		println(line)
+	end
+end
+
+function discard_indels(vcf_file::IO)
+	line = skip_to_header(vcf_file); println(line);
+	for line in eachline(vcf_file)
+		c = split(line, '\t')
+		if length(c[3]) == 1 && length(c[4]) == 1 && c[3] != "-" && c[4] != "-"
+			println(line)
+		end
+	end
+end
+
+function discard_if_frequency_above(vcf_file::IO, db_path, threshold::Float64)
+	db = open(deserialize, db_path)
+	println(skip_to_header(vcf_file))
+	chr = ""; anno = nothing
+	for line in eachline(vcf_file)
+		c = split(line, '\t')
+		if drop_chr_prefix(c[1]) != chr
+			chr = drop_chr_prefix(c[1])
+			anno = get(db.chromosomes, chr, nothing)
+		end
+		if anno != nothing
+			matches = searchsorted(anno.position, parse(Int32, c[2]))
+			if !isempty(matches)
+				change = encode_ref_alt(c[3], c[4])
+				if any(m -> anno.change[m] == change &&
+					anno.annotation[m] >= threshold, matches)
+					continue;
+				end
+			end
+		end
+		println(join(c, '\t'))
+	end
+end
+
+
+function group_by_snp_profile(hetz_snp_vcf::IO)
+	headers = split(rstrip(skip_to_header(hetz_snp_vcf)), '\t')
+	sample_col = findone(headers, "NOTES") + 1
+	samples = headers[sample_col:end]; S = length(samples);
+
+	# The matrix stores genotypes for every sample:
+	# 0 = unknown, 1 = homz ref, 2 = hetz, 3 = homz alt
+	println(stderr, "Constructing genotype matrix...")
+	genotypes = zeros(Int8, 1_000_000, S); r = 0
+	for line in eachline(hetz_snp_vcf)
+		c = split(rstrip(line, '\n'), '\t')
+		r += 1
+		for (s, cell) in enumerate(c[sample_col:end])
+			parts = split(cell, ':')
+			alt = parse(Int, parts[1]); total = parse(Int, parts[2])
+			if total < 30; continue; end
+			#b = Binomial(total, 0.5)
+			#if 0.3 <= cdf(b, alt) <= 0.7
+			if 0.3 <= alt / total <= 0.7
+				genotypes[r, s] = 2
+			elseif alt / total >= 0.98
+				genotypes[r, s] = 3
+			elseif alt / total <= 0.02
+				genotypes[r, s] = 1
+			end
+		end
+	end
+	genotypes = genotypes[1:r, :]
+
+	for i in 1:S
+		any_matches = false
+		for j in 1:S
+			if j == i; continue; end
+			matched = 0; total = 0;
+			for r in 1:size(genotypes, 1)
+				if genotypes[r, i] == 0 || genotypes[r, j] == 0; continue; end
+				total += 1
+				matched += (genotypes[r, i] == genotypes[r, j])
+			end
+			if matched / total >= 0.99 && total >= 50
+				any_matches = true
+				if j > i      # Don't print pairs twice
+					println("$(samples[i]) <-> $(samples[j]): $matched / $total matched")
+				end
+			end
+		end
+
+		if any_matches == false
+			println("$(samples[i]) does not match with any other samples.")
+		end
+	end
+end
+
+
+
+# Before calculating mutation rate, need to generate genome-wide coverage
+# profiles with the following command:
+# sam coverage histogram $x > ../coverage_histograms/${x/.bam/.tsv}
+function mutation_rate(vcf_file::IO, coverage_histogram_dir::String;
+	alt_reads=8, detailed=false)
+	vcf = read_vcf(vcf_file); S = length(vcf.sample);
+	human_chr = vcat(map(x -> "chr$(x)", 1:22), ["chrX", "chrY"]);
+
+	if detailed == false
+		println("SAMPLE\tPROTEIN ALTERING\tSILENT\tPROTEIN ALTERING (RATE)\tSILENT (RATE)")
+	end
+
+	for s in 1:S
+		protein_altering = 0; silent = 0;
+		protein_altering_rate = 0; silent_rate = 0;
+		histogram_file = "$(coverage_histogram_dir)/$(vcf.sample[s]).tsv"
+		if !isfile(histogram_file)
+			warn("No coverage histogram found for $(vcf.sample[s])...")
+			continue
+		end
+
+		# The histogram vector reports on how many genomic sites have a
+		# specific coverage. For example, histogram[1] is the number of
+		# genomic sites with 1x coverage.
+		histogram = readdlm(histogram_file, '\t')[2:end, 2]
+
+		for r in 1:size(vcf, 1)
+			if !vcf.star[r, s]; continue; end
+			min_depth = ceil(Int, alt_reads / (vcf.alt[r, s] / vcf.total[r, s]))
+			amenable_mbs = sum(histogram[min_depth:end]) / 1e6
+			
+			if is_protein_altering(vcf.effect[r])
+				protein_altering += 1
+				protein_altering_rate += 1 / amenable_mbs
+			else
+				silent += 1
+				silent_rate += 1 / amenable_mbs
+			end
+
+			if detailed
+				@printf("%s\t%s\t%d\t%s\t%s\t%.2f\n", vcf.sample[s],
+					vcf.chromosome[r], vcf.position[r], vcf.ref_allele[r],
+					vcf.alt_allele[r], 1 / amenable_mbs)
+			end
+		end
+
+		if detailed == false
+			@printf("%s\t%d\t%d\t%.2f\t%.2f\n", vcf.sample[s], protein_altering, silent, protein_altering_rate, silent_rate)
+		end
+	end
+end
+
+subcommands(somatic, germline, heterozygous_snps,
+	keep_samples, discard_samples,
+	discard_if_frequency_above, discard_blacklisted, discard_indels,
+	protein_altering, predict_effect, annotate, build_annotation_database,
+	group_by_snp_profile, mutation_rate)

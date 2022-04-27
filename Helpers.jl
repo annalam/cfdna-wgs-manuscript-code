@@ -66,25 +66,6 @@ readtsv(cmd::Base.AbstractCmd; kwargs...) =
 	open(f -> readtsv(f; kwargs...), cmd)
 readtsv(tsv_path::AbstractString; kwargs...) =
 	tsv_path == "-" ? readtsv(STDIN; kwargs...) : open(f -> readtsv(f; kwargs...), expanduser(tsv_path))
-function readtsv_dict(tsv_path::AbstractString; dim="cols")
-	d=readdlm(tsv_path, '\t')
-	if dim .== "rows"
-		keynames = d[:,1]
-		d = permutedims(d[:,2:end], (2,1))
-	elseif dim .== "cols"
-		keynames = string.(d[1,:])
-		d = d[2:end,:]
-	end
-	for key in unique(keynames)
-		dups = findall(keynames.==key)
-		if length(dups) > 1
-			for (i, di) in enumerate(dups)
-				keynames[di] = keynames[di]*"("*string(i)*")"
-			end
-		end
-	end
-	Dict(keynames[ki]=>d[:,ki] for ki in 1:length(keynames))
-end
 
 function hierarchical_order(args...)
 	for a in 2:length(args); @assert(length(args[a]) == length(args[1])); end
@@ -110,17 +91,5 @@ function runs(values::AbstractVector)
 	push!(runs, start:length(values))
 	return runs
 end
-
-# function parse_date(x::AbstractString, century::Int)
-# 	if x == "" || x == "."; return nothing; end
-# 	if r"[0-9][0-9]-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-[0-9]+" in x
-# 		d = try Date(x, "d-u-y") catch; error("Invalid date: $(x)") end
-# 	elseif r"\d+/\d+/\d+" in x
-# 		d = try Date(x, "m/d/y") catch; error("Invalid date: $(x)") end
-# 	else
-# 		error("Invalid date: $(x)")
-# 	end
-# 	return d + Dates.Year(century)
-# end
 
 end
