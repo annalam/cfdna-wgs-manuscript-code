@@ -255,7 +255,7 @@ gatk Mutect2 -R hg38.fa -L broad_wgs_calling_regions.hg38.interval_list \
   -O patient.somatic.vcf.gz
 ```
 
-The optional argument `--f1r2-tar-gz patient.f1r2.tar.gz` instructed GATK Mutect2 to collect statistics into file `patient.f1r2.tar.gz` that will now be used to generate an orientation bias model:
+The optional argument `--f1r2-tar-gz patient.f1r2.tar.gz` instructed GATK Mutect2 to collect statistics into file `patient.f1r2.tar.gz` that was then used to generate an orientation bias model:
 ```
 gatk LearnReadOrientationModel -I patient.f1r2.tar.gz -O patient.orientation_model.tar.gz
 ```
