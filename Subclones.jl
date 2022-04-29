@@ -1496,7 +1496,7 @@ function clonal_expansion_plot(psa, pt, scf, st, parents; zerostate_start=-50, s
 			interp = vcat(interp, itp)
 		end
 		return interp
-	end
+	end'...)
 
 	# calculate interpolated lineage fractions
 	linfi = copy(scfi)

@@ -58,7 +58,7 @@ global deviated_hsaf_table = nothing
 function hsaf_deviation_from_table(true_hsaf, depth)
 	global deviated_hsaf_table
     if deviated_hsaf_table == nothing
-    	data_dir = "$(@__DIR__)/../data"
+    	data_dir = "$(@__DIR__)/data"
     	deviated_hsaf_table = deserialize("$data_dir/deviated_hsaf_table.jls")["deviated_hsaf_table"]
     end
 	depth_i = max(1, round.(Int, depth))
@@ -106,7 +106,7 @@ end
 global true_hsaf_table = nothing
 function true_hsaf_from_table(obs_hsaf, depth)
     if true_hsaf_table == nothing
-    	data_dir = "$(@__DIR__)/../data"
+    	data_dir = "$(@__DIR__)/data"
     	true_hsaf_table = deserialize("$data_dir/true_hsaf_table.jls")["true_hsaf_table"]
     end
 	depth_i = max(1, round.(Int, depth))

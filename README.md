@@ -16,7 +16,7 @@ Our analysis software and scripts are written using the Julia and Rust programmi
 3. Install required Julia packages:
 ```
 import Pkg;
-Pkg.add(split("Distributions HypothesisTests PyCall KernelDensity Interpolations"))
+Pkg.add(split("StatsBase Distributions HypothesisTests PyCall KernelDensity Interpolations Combinatorics Suppressor"))
 ```
 4. Modify your JULIA_LOAD_PATH environment variable so that Julia can find the code modules found in the root directory of this repository:
 ```
