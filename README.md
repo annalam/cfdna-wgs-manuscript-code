@@ -18,7 +18,7 @@ Our analysis software and scripts are written using the Julia and Rust programmi
 import Pkg;
 Pkg.add(split("StatsBase Distributions HypothesisTests PyCall KernelDensity Interpolations Combinatorics Suppressor"))
 ```
-4. Modify your JULIA_LOAD_PATH environment variable so that Julia can find the code modules found in the root directory of this repository:
+4. Modify your JULIA_LOAD_PATH environment variable so that Julia can find the code modules found in the root directory of this repository (the colon at the end of the path is important):
 ```
 export JULIA_LOAD_PATH=/path/to/this/repository:
 ```
