@@ -815,6 +815,8 @@ function bayesian_clustering(cancer_fraction, alt_reads, total_reads, total_cn;
 						cluster_lh[c] = 0 # MACN cannot be higher than region CN
 						break
 					end
+					mut_cn = min(mut_cn, total_cn[m, s])
+
 					emaf = expected_maf(cancer_fraction[s], mut_cn, total_cn[m, s], 2)
 					dist = Binomial(round(Int, dispersion_factor * total_reads[m, s]), emaf)
 					cluster_lh[c] *= pdf(dist, round(Int, dispersion_factor * alt_reads[m, s]))
